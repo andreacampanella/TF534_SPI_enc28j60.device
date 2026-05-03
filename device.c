@@ -35,6 +35,7 @@
 
 #include <hardware/custom.h>
 #include <hardware/intbits.h>
+#include <devices/timer.h>
 
 #include "nic.h"
 #include "spi.h"
@@ -92,6 +93,8 @@ typedef struct
     etherspi_buffer_funcs_t				*bf;
     unsigned char						frame[NIC_MTU + sizeof(nic_eth_hdr_t)];
     BPTR								saved_seg_list;
+    struct MsgPort                      timer_port;
+    struct timerequest                  timer_req;
     spi_t                               spi;
 } etherspi_ctx_t;
 #pragma pack(pop)
@@ -148,7 +151,7 @@ static void device_query(struct IOSana2Req *req)
 
 void __saveds device_task(void)
 {
-    UBYTE nic_keep_alive_interval = 0;
+    UWORD nic_keep_alive_interval = 0;
 
     while (1)
 	{
@@ -209,7 +212,7 @@ void __saveds device_task(void)
 		if (sigs & ctx->rx_signal_mask)
 		{
 			nic_keep_alive_interval++;
-			nic_keep_alive_interval &= 0x3f;
+			nic_keep_alive_interval &= 0x3ff;
 			if(nic_keep_alive_interval == 0)
 				nic_keep_alive(&ctx->spi);
 		}
@@ -217,6 +220,15 @@ void __saveds device_task(void)
         //check periodically for new packets
         if (sigs & ctx->rx_signal_mask)
 		{
+            if (CheckIO((struct IORequest*)&ctx->timer_req))
+            {
+                WaitIO((struct IORequest*)&ctx->timer_req);
+                ctx->timer_req.tr_node.io_Command = TR_ADDREQUEST;
+                ctx->timer_req.tr_time.tv_secs    = 0;
+                ctx->timer_req.tr_time.tv_micro   = 1000;
+                SendIO((struct IORequest*)&ctx->timer_req);
+            }
+
 			/* Signal from periodic vertical blank interrupt, poll for RX data */
             do
             {
@@ -353,6 +365,25 @@ static struct Device *init_device(__reg("a6") struct ExecBase *sys_base, __reg("
 
     /* Start receiver task */
 	ctx->handler_task = CreateTask((char *)ETHERSPI_TASK_NAME, ETHERSPI_TASK_PRIO, (char *)device_task, ETHERSPI_STACK_SIZE);
+
+    ctx->timer_port.mp_Flags        = PA_SIGNAL;
+    ctx->timer_port.mp_SigBit       = ctx->rx_signal;
+    ctx->timer_port.mp_SigTask      = ctx->handler_task;
+    ctx->timer_port.mp_Node.ln_Type = NT_MSGPORT;
+    NewList(&ctx->timer_port.mp_MsgList);
+
+    if (OpenDevice("timer.device", UNIT_MICROHZ,
+                   (struct IORequest*)&ctx->timer_req, 0) != 0)
+    {
+        ERROR("timer.device open failed\n");
+        goto error;
+    }
+    ctx->timer_req.tr_node.io_Message.mn_ReplyPort   = &ctx->timer_port;
+    ctx->timer_req.tr_node.io_Message.mn_Node.ln_Type = NT_MESSAGE;
+    ctx->timer_req.tr_node.io_Command = TR_ADDREQUEST;
+    ctx->timer_req.tr_time.tv_secs    = 0;
+    ctx->timer_req.tr_time.tv_micro   = 1000;
+    SendIO((struct IORequest*)&ctx->timer_req);
 
 	/* Register /INT2 handler */
 	ctx->interrupt.is_Data = ctx;
