@@ -1,7 +1,59 @@
-echo "building network driver test program"
-vc nic-test.c vb_interrupt.c vb_interrupt_server.asm enc28j60.c timer.c sd-plus/spi.c sd-plus/spi_low.s -Isd-plus -lamiga -O2 -o /amiga/nic_test
+#!/bin/bash
+# Build script for enc28j60.device + nic_test on TF534
+# Runs inside walkero/docker4amigavbcc:latest-m68k
+set -e
 
-echo "building enc28j60.device"
-vc romtag.asm device.c interrupt.asm enc28j60.c timer.c sd-plus/spi.c sd-plus/spi_low.s -Isd-plus  -lamiga -nostdlib -O2 -o /amiga/enc28j60.device
+NDK_INC="-I/opt/sdk/NDK3.2/Include_H -I/opt/sdk/NDK3.2/SANA+RoadshowTCP-IP/include -I/opt/sdk/NDK3.2/SANA+RoadshowTCP-IP/include/devices"
+INCS="-Isd-plus $NDK_INC"
+COPTS="-O2 -hunkdebug"
+TGT="+aos68k"
 
-ask "press return to close this window"
+OUT="${OUT:-/amiga}"
+mkdir -p obj "$OUT"
+
+compile_c() {
+    local src="$1"
+    local obj="obj/$(echo ${src%.*} | tr / _).o"
+    echo "  CC  $src" >&2
+    vc $TGT $INCS $COPTS -c -o "$obj" "$src" >&2
+    echo "$obj"
+}
+
+assemble() {
+    local src="$1"
+    local obj="obj/$(echo ${src%.*} | tr / _).o"
+    echo "  AS  $src" >&2
+    vasmm68k_mot -kick1hunks -Fhunk -nosym -quiet -o "$obj" "$src" >&2
+    echo "$obj"
+}
+
+echo "=== nic_test ==="
+NOBJS=""
+for s in nic-test.c vb_interrupt.c enc28j60.c timer.c sd-plus/spi.c; do
+    NOBJS="$NOBJS $(compile_c $s)"
+done
+NOBJS="$NOBJS $(assemble vb_interrupt_server.asm)"
+echo "  LD  nic_test"
+vlink -bamigahunk -x -Bstatic -Cvbcc -mrel \
+    "$VBCC/targets/m68k-amigaos/lib/startup.o" \
+    $NOBJS \
+    -L"$VBCC/targets/m68k-amigaos/lib" -lvc -lamiga \
+    -s -Rshort -o "$OUT/nic_test"
+echo "  -> $OUT/nic_test"
+
+echo "=== enc28j60.device ==="
+DOBJS=""
+for s in device.c enc28j60.c timer.c sd-plus/spi.c; do
+    DOBJS="$DOBJS $(compile_c $s)"
+done
+for s in romtag.asm interrupt.asm; do
+    DOBJS="$DOBJS $(assemble $s)"
+done
+echo "  LD  enc28j60.device"
+vlink -bamigahunk -x -Bstatic -Cvbcc -nostdlib -mrel \
+    $DOBJS \
+    -L"$VBCC/targets/m68k-amigaos/lib" -lamiga \
+    -s -Rshort -o "$OUT/enc28j60.device"
+echo "  -> $OUT/enc28j60.device"
+
+echo "Done."
